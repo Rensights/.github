@@ -1,0 +1,138 @@
+name: Build and Deploy on Server
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      service:
+        required: true
+        type: string
+      service_path:
+        required: true
+        type: string
+      dockerfile_path:
+        required: true
+        type: string
+      image_name:
+        required: true
+        type: string
+      build_args:
+        required: false
+        type: string
+        default: ''
+      namespace:
+        required: true
+        type: string
+      deployment_name:
+        required: true
+        type: string
+    secrets:
+      SSH_PRIVATE_KEY:
+        required: true
+      SSH_HOST:
+        required: true
+      SSH_USER:
+        required: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Sync code to server
+        run: |
+          rsync -avz --delete \
+            --exclude 'node_modules' \
+            --exclude 'target' \
+            --exclude '.next' \
+            --exclude '.git' \
+            -e "ssh -o StrictHostKeyChecking=no" \
+            ${{ inputs.service_path }}/ \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/root/rensights/${{ inputs.service_path }}/
+
+      - name: Build and Deploy on Server
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'BUILD_SCRIPT'
+            set -e
+            
+            ENV="${{ inputs.environment }}"
+            SERVICE_PATH="${{ inputs.service_path }}"
+            DOCKERFILE="${{ inputs.dockerfile_path }}"
+            IMAGE_NAME="${{ inputs.image_name }}"
+            IMAGE_TAG="${IMAGE_NAME}:${ENV}-${{ github.sha }}"
+            NAMESPACE="${{ inputs.namespace }}"
+            DEPLOYMENT_NAME="${{ inputs.deployment_name }}"
+            
+            cd /root/rensights || cd $HOME/rensights || cd /opt/rensights
+            cd $SERVICE_PATH
+            
+            echo "🔨 Building $IMAGE_TAG..."
+            echo "📁 Working directory: $(pwd)"
+            
+            # Parse build args
+            BUILD_ARGS_STR="${{ inputs.build_args }}"
+            DOCKER_BUILD_CMD="docker build -t $IMAGE_TAG"
+            
+            if [ ! -z "$BUILD_ARGS_STR" ]; then
+              for arg in $BUILD_ARGS_STR; do
+                DOCKER_BUILD_CMD="$DOCKER_BUILD_CMD --build-arg $arg"
+              done
+            fi
+            
+            # Dockerfile should be in service root
+            # Build context is the service root (includes src/)
+            if [ -f "$DOCKERFILE" ]; then
+              DOCKER_BUILD_CMD="$DOCKER_BUILD_CMD -f $DOCKERFILE ."
+            else
+              echo "❌ Dockerfile not found: $DOCKERFILE"
+              echo "📂 Available files in $(pwd):"
+              ls -la
+              exit 1
+            fi
+            
+            # Execute build
+            eval $DOCKER_BUILD_CMD
+            
+            echo "✅ Image built: $IMAGE_TAG"
+            
+            # Also tag as latest for the environment
+            docker tag $IMAGE_TAG ${IMAGE_NAME}:${ENV}-latest || true
+            
+            echo "🚀 Deploying to Kubernetes..."
+            export KUBECONFIG=$HOME/.kube/config || export KUBECONFIG=/etc/kubernetes/admin.conf
+            
+            # Update deployment
+            if kubectl get deployment $DEPLOYMENT_NAME -n $NAMESPACE &>/dev/null; then
+              kubectl set image deployment/$DEPLOYMENT_NAME \
+                $DEPLOYMENT_NAME=$IMAGE_TAG \
+                -n $NAMESPACE || {
+                  kubectl patch deployment $DEPLOYMENT_NAME -n $NAMESPACE -p \
+                    '{"spec":{"template":{"spec":{"containers":[{"name":"'$DEPLOYMENT_NAME'","image":"'$IMAGE_TAG'"}]}}}}'
+                }
+              
+              kubectl rollout restart deployment/$DEPLOYMENT_NAME -n $NAMESPACE || true
+              kubectl rollout status deployment/$DEPLOYMENT_NAME -n $NAMESPACE --timeout=5m || true
+            else
+              echo "⚠️  Deployment $DEPLOYMENT_NAME not found in namespace $NAMESPACE"
+              echo "Available deployments:"
+              kubectl get deployments -n $NAMESPACE || true
+            fi
+            
+            echo "✅ Deployment completed"
+          BUILD_SCRIPT
+
